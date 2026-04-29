@@ -1,29 +1,38 @@
-import socket #pra fazer a conexao de rede (o servidor ouvindo)
-import threading #MUITO IMPORTANTE: pra cada cliente q entra, o server cria uma thread nova e nao trava os outros
-import sqlite3 #banco de dados pra guardar logins e msgs de quem ta offline
-import json #pra entender os pacotinhos de texto q o cliente manda
-import time #pra dar uns delays estrategicos e nao engasgar o envio de msgs
+import socket
+import threading
+import sqlite3
+import json
+import secrets
+from security import SecurityEngine
 
-#Configs de rede
-HOST = '127.0.0.1' #roda local
-PORT = 5000 #mesma porta do cliente
+HOST = '127.0.0.1'
+PORT = 5000
 
-#Dicionario pra guardar quem ta online no momento. Ex: {'joao': <objeto_socket_do_joao>}
-clients = {} 
-
-#Trava de segurança do Banco de Dados (Mutex)
-#Defesa pro professor: "Como tem varias threads rodando, se 2 clientes tentarem salvar algo no BD na mesma hora, ele corrompe. O lock organiza a fila."
-db_lock = threading.Lock() 
+clients = {}
+client_sessions = {}
+db_lock = threading.Lock()
+sec = SecurityEngine()
+pending_challenges = {}
 
 def init_db():
     #Cria o banco do servidor
     with sqlite3.connect("server_db.sqlite") as conn:
         c = conn.cursor()
-        #Tabela pra logins (UNIQUE garante q ninguem crie conta com msm nome)
-        c.execute("CREATE TABLE IF NOT EXISTS users (username TEXT UNIQUE, password TEXT)")
-        #Tabela inteligente: so guarda a msg se o destinatario estiver offline. Quando ele logar, recebe e apaga daqui.
-        c.execute("CREATE TABLE IF NOT EXISTS offline_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT, timestamp TEXT, text TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS users (username TEXT UNIQUE, password_hash TEXT, public_key TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS offline_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT, timestamp TEXT, payload TEXT)")
         conn.commit()
+
+def secure_send(sock, data_dict):
+    keys = client_sessions.get(sock)
+    if keys:
+        pt = json.dumps(data_dict)
+        iv, ct, mac = sec.encrypt_and_mac(keys[0], keys[1], pt)
+        payload = {"iv": iv.hex(), "ciphertext": ct.hex(), "mac": mac.hex()}
+        try: sock.send((json.dumps(payload) + '\n').encode('utf-8'))
+        except: pass
+    else:
+        try: sock.send((json.dumps(data_dict) + '\n').encode('utf-8'))
+        except: pass
 
 def broadcast_status():
     #Pega a lista de chaves do dict (quem ta com socket aberto = online)
@@ -34,109 +43,88 @@ def broadcast_status():
         c = conn.cursor()
         c.execute("SELECT username FROM users")
         all_users = [row[0] for row in c.fetchall()]
-        
-    #Monta o JSON e avisa GERAL q o status de alguem mudou (entrou ou saiu)
-    msg = json.dumps({"type": "status_update", "online": online_users, "all": all_users}).encode('utf-8')
+    msg_dict = {"type": "status_update", "online": online_users, "all": all_users}
     for user, sock in clients.items():
-        try:
-            sock.send(msg)
-        except:
-            pass #se der erro pra mandar pra um, ignora e segue a vida
+        secure_send(sock, msg_dict)
 
 def handle_client(conn_socket, addr):
     #Essa funcao roda em paralelo (thread) pra CADA cliente q conecta.
     current_user = None
     try:
         while True:
-            #Fica ouvindo oq o cliente mandou (ate 4096 bytes)
-            data = conn_socket.recv(4096)
-            if not data:
-                break #se vier vazio, o cliente desconectou
-            
-            #Transforma o texto q chegou de volta num dicionario Python
-            request = json.loads(data.decode('utf-8'))
+            data = conn_socket.recv(16384)
+            if not data: break
+            msgs = data.decode('utf-8').split('\n')
+            for msg_str in msgs:
+                if not msg_str.strip(): continue
+                payload = json.loads(msg_str)
+                if "ciphertext" in payload:
+                    keys = client_sessions.get(conn_socket)
+                    if not keys: continue
+                    plaintext = sec.verify_mac_and_decrypt(keys[0], keys[1], bytes.fromhex(payload["iv"]), bytes.fromhex(payload["ciphertext"]), bytes.fromhex(payload["mac"]))
+                    if not plaintext: continue
+                    request = json.loads(plaintext)
+                else: request = payload
 
-            #IFs que decidem oq o servidor faz baseado no tipo de pacote q chegou
-            
-            if request["type"] == "register":
-                u = request["user"]
-                p = request["pass"]
-                with db_lock: #Trava o BD pra registrar sem conflito
+                if request["type"] == "dh_exchange":
+                    dh_priv, dh_pub = sec.generate_dh_keypair()
+                    shared = sec.compute_shared_secret(dh_priv, bytes.fromhex(request["pub_key"]))
+                    k1, k2 = sec.derive_keys_hkdf(shared, bytes.fromhex(request["salt"]))
+                    client_sessions[conn_socket] = (k1, k2)
+                    conn_socket.send((json.dumps({"type": "dh_exchange_ack", "pub_key": dh_pub.hex()}) + '\n').encode('utf-8'))
+
+                elif request["type"] == "register":
+                    try:
+                        pwd_hash = sec.hash_password(request["pass"])
+                        with db_lock:
+                            with sqlite3.connect("server_db.sqlite") as conn_db:
+                                c = conn_db.cursor()
+                                c.execute("INSERT INTO users (username, password_hash, public_key) VALUES (?, ?, ?)", (request["user"], pwd_hash, request["pub_key"]))
+                                conn_db.commit()
+                                secure_send(conn_socket, {"type": "register_ack", "success": True})
+                    except: secure_send(conn_socket, {"type": "register_ack", "success": False})
+
+                elif request["type"] == "login_request":
                     with sqlite3.connect("server_db.sqlite") as conn_db:
                         c = conn_db.cursor()
-                        try:
-                            #Tenta criar a conta
-                            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (u, p))
-                            conn_db.commit()
-                            conn_socket.send(json.dumps({"type": "register_ack", "success": True}).encode('utf-8'))
-                        except sqlite3.IntegrityError:
-                            #Se cair aqui, o UNIQUE barrou pq o nome ja existe
-                            conn_socket.send(json.dumps({"type": "register_ack", "success": False}).encode('utf-8'))
+                        c.execute("SELECT public_key FROM users WHERE username=?", (request["user"],))
+                        row = c.fetchone()
+                        if row:
+                            nonce = secrets.token_hex(32)
+                            pending_challenges[conn_socket] = {"user": request["user"], "nonce": nonce, "pub_key": row[0]}
+                            secure_send(conn_socket, {"type": "login_challenge", "nonce": nonce})
+                        else: secure_send(conn_socket, {"type": "login_ack", "success": False})
 
-            elif request["type"] == "login":
-                u = request["user"]
-                p = request["pass"]
-                with sqlite3.connect("server_db.sqlite") as conn_db:
-                    c = conn_db.cursor()
-                    #Verifica se user e senha batem
-                    c.execute("SELECT * FROM users WHERE username=? AND password=?", (u, p))
-                    
-                    if c.fetchone(): #Se achou no BD
-                        current_user = u
-                        clients[u] = conn_socket #Salva o socket do cara no dicionario de onlines
-                        conn_socket.send(json.dumps({"type": "login_ack", "success": True}).encode('utf-8'))
-                        broadcast_status() #Avisa geral q ele entrou
+                elif request["type"] == "login_verify":
+                    ch = pending_challenges.get(conn_socket)
+                    if ch and sec.verify_signature(bytes.fromhex(ch["pub_key"]), bytes.fromhex(request["signature"]), bytes.fromhex(ch["nonce"])):
+                        current_user = request["user"]
+                        clients[current_user] = conn_socket
+                        secure_send(conn_socket, {"type": "login_ack", "success": True})
+                        broadcast_status()
+                    else: secure_send(conn_socket, {"type": "login_ack", "success": False})
 
-                        #VERIFICA MSGS OFFLINE: Se alguem mandou msg enquanto ele tava fora, descarrega agora
-                        c.execute("SELECT id, sender, timestamp, text FROM offline_messages WHERE recipient=?", (u,))
-                        offline_msgs = c.fetchall()
-                        for msg in offline_msgs:
-                            msg_data = {"type": "msg", "sender": msg[1], "recipient": u, "timestamp": msg[2], "text": msg[3]}
-                            conn_socket.send(json.dumps(msg_data).encode('utf-8'))
-                            time.sleep(0.05) #Defesa: delayzinho curto pra nao colar os JSONs no socket e quebrar o cliente
-                        
-                        #Limpou a caixa postal, deleta as msgs do BD pra nao mandar repetido depois
-                        c.execute("DELETE FROM offline_messages WHERE recipient=?", (u,))
-                        conn_db.commit()
-                    else:
-                        #Senha errada ou user nao existe
-                        conn_socket.send(json.dumps({"type": "login_ack", "success": False}).encode('utf-8'))
+                elif request["type"] == "get_pub_key":
+                    with sqlite3.connect("server_db.sqlite") as conn_db:
+                        c = conn_db.cursor()
+                        c.execute("SELECT public_key FROM users WHERE username=?", (request["target"],))
+                        row = c.fetchone()
+                        if row: secure_send(conn_socket, {"type": "pub_key_res", "target": request["target"], "pub_key": row[0]})
 
-            elif request["type"] == "msg":
-                recipient = request["recipient"]
-                #Se o cara ta no dicionario, ta online -> manda a msg direto pra ele
-                if recipient in clients:
-                    try:
-                        clients[recipient].send(json.dumps(request).encode('utf-8'))
-                    except:
-                        pass
-                else:
-                    #Se nao ta no dict, ta offline -> guarda no BD pro futuro
-                    with db_lock:
-                        with sqlite3.connect("server_db.sqlite") as conn_db:
-                            c = conn_db.cursor()
-                            c.execute("INSERT INTO offline_messages (sender, recipient, timestamp, text) VALUES (?, ?, ?, ?)",
-                                      (request["sender"], recipient, request["timestamp"], request["text"]))
-                            conn_db.commit()
-
-            elif request["type"] == "typing":
-                recipient = request["recipient"]
-                #Se o cara ta online, repassa o aviso q o amigo ta digitando. 
-                #Obs: Se ele ta offline, a gente ignora. Nao faz sentido guardar "digitando..." no BD.
-                if recipient in clients:
-                    try:
-                        clients[recipient].send(json.dumps(request).encode('utf-8'))
-                    except:
-                        pass
-    except Exception:
-        #Se der qualquer erro bizarro de rede (cabo solto, fechou no X da janela), ignora e cai no finally
-        pass
+                elif request["type"] in ["e2ee_handshake_init", "e2ee_handshake_res", "e2ee_auth_req", "e2ee_auth_res", "msg", "typing"]:
+                    target = request.get("recipient") or request.get("target")
+                    if target in clients: secure_send(clients[target], request)
+                    elif request["type"] == "msg":
+                        with db_lock:
+                            with sqlite3.connect("server_db.sqlite") as conn_db:
+                                c = conn_db.cursor()
+                                c.execute("INSERT INTO offline_messages (sender, recipient, timestamp, payload) VALUES (?, ?, ?, ?)", (request["sender"], target, request["timestamp"], json.dumps(request)))
+                                conn_db.commit()
+    except: pass
     finally:
-        #Isso aqui roda sempre q o cliente desconectar (por erro ou de proposito)
-        if current_user in clients:
-            del clients[current_user] #Tira o cara da lista de onlines
-            broadcast_status() #Avisa o resto q a bolinha dele ficou cinza (offline)
-        conn_socket.close() #Mata a conexao com segurança
+        if current_user in clients: del clients[current_user]
+        broadcast_status()
+        conn_socket.close()
 
 def start_server():
     #Configura banco e sobe o servidor
